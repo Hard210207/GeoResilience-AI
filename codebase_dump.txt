@@ -1,0 +1,2390 @@
+================================================================================
+PROJECT FILE TREE: GeoResilience-AI
+================================================================================
+GeoResilience-AI/
+├── .gitignore
+├── README.md
+├── backend/
+│   ├── data/
+│   │   ├── cost_map.npy
+│   │   └── skeleton.npy
+│   ├── main.py
+│   └── requirements.txt
+└── frontend/
+    ├── .gitignore
+    ├── .oxlintrc.json
+    ├── README.md
+    ├── index.html
+    ├── package.json
+    ├── public/
+    │   ├── favicon.svg
+    │   └── icons.svg
+    ├── src/
+    │   ├── App.css
+    │   ├── App.jsx
+    │   ├── assets/
+    │   │   ├── hero.png
+    │   │   ├── react.svg
+    │   │   └── vite.svg
+    │   ├── index.css
+    │   └── main.jsx
+    └── vite.config.js
+
+================================================================================
+SOURCE FILE CONTENTS
+================================================================================
+
+================================================================================
+FILE: backend/main.py
+================================================================================
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import os
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import networkx as nx
+import numpy as np
+from pyproj import Transformer
+
+# Try importing sknw; if unavailable, a fallback skeleton graph builder is provided
+try:
+    import sknw
+except ImportError:
+    sknw = None
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load data and construct graph on server startup
+    if cached_graph_payload is None:
+        initialize_data_and_graph()
+    yield
+
+# Initialize FastAPI application with lifespan
+app = FastAPI(
+    title="GeoResilience AI - Backend Routing Engine",
+    description="FastAPI backend loading satellite road skeleton & cost maps, building topological graphs with NetworkX, and transforming EPSG:32643 metric coordinates to EPSG:4326 spherical coordinates via pyproj.",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Enable CORS for frontend applications (Leaflet, MapLibre, React, Streamlit, etc.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Constants & Coordinate Reference System (CRS) Transform Configuration
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+SKELETON_PATH = DATA_DIR / "skeleton.npy"
+COST_MAP_PATH = DATA_DIR / "cost_map.npy"
+
+# Mumbai SpaceNet 5 (AOI 8) UTM Zone 43N (EPSG:32643) Extents
+# Top-Left: (Easting: 273669.1958m, Northing: 2100455.1061m)
+# Bottom-Right: (Easting: 274049.0542m, Northing: 2100045.9271m)
+DEFAULT_ORIGIN_UTM_X = 273669.1957842016
+DEFAULT_ORIGIN_UTM_Y = 2100455.1060993737
+DEFAULT_MAX_UTM_X = 274049.0541976987
+DEFAULT_MIN_UTM_Y = 2100045.927091601
+DEFAULT_GSD = 0.3077  # Ground Sample Distance: ~0.3077 meters/pixel
+
+# Pyproj Transformer from metric UTM Zone 43N to spherical WGS84
+# always_xy=True guarantees (Longitude, Latitude) order
+transformer = Transformer.from_crs("EPSG:32643", "EPSG:4326", always_xy=True)
+
+# Global variables for loaded data & built graph
+skeleton_data: Optional[np.ndarray] = None
+cost_map_data: Optional[np.ndarray] = None
+network_graph: Optional[nx.Graph] = None
+cached_graph_payload: Optional[Dict[str, Any]] = None
+cached_geojson_payload: Optional[Dict[str, Any]] = None
+
+
+def pixel_to_coordinates(
+    row: float,
+    col: float,
+    img_height: int = 1300,
+    img_width: int = 1300
+) -> Dict[str, Any]:
+    """
+    Transforms pixel coordinates (row, col) into:
+    1. Metric coordinates in UTM Zone 43N (EPSG:32643)
+    2. Spherical coordinates in WGS84 (EPSG:4326) [latitude, longitude] (Y, X)
+    """
+    pixel_size_x = (DEFAULT_MAX_UTM_X - DEFAULT_ORIGIN_UTM_X) / img_width
+    pixel_size_y = (DEFAULT_ORIGIN_UTM_Y - DEFAULT_MIN_UTM_Y) / img_height
+
+    # Metric coordinates (EPSG:32643)
+    utm_x = DEFAULT_ORIGIN_UTM_X + col * pixel_size_x
+    utm_y = DEFAULT_ORIGIN_UTM_Y - row * pixel_size_y
+
+    # Spherical coordinates (EPSG:4326) via pyproj
+    lon, lat = transformer.transform(utm_x, utm_y)
+
+    return {
+        "pixel": [int(round(row)), int(round(col))],
+        "utm": [float(utm_x), float(utm_y)],
+        "coordinates": [float(lat), float(lon)],  # [latitude, longitude] (Y, X)
+        "lat": float(lat),
+        "lon": float(lon)
+    }
+
+
+def remove_isolated_nodes(G: nx.Graph) -> List[Any]:
+    """
+    Cleans up spurious isolated nodes (nodes with a degree of 0) from the graph.
+    Only nodes that are connected to road edges are retained.
+    """
+    isolated_nodes = [node for node in list(G.nodes()) if G.degree(node) == 0]
+    if isolated_nodes:
+        print(f"Removing {len(isolated_nodes)} spurious isolated nodes (degree 0): {isolated_nodes}")
+        G.remove_nodes_from(isolated_nodes)
+    return isolated_nodes
+
+
+def build_graph_from_skeleton(skeleton: np.ndarray, cost_map: np.ndarray) -> nx.Graph:
+    """
+    Builds a NetworkX graph from a 2D binary morphological skeleton.
+    Uses sknw if available, with a pure NetworkX fallback.
+    Calculates routing costs along each edge using the cost_map array.
+    """
+    if sknw is not None:
+        raw_graph = sknw.build_sknw(skeleton.astype(np.uint16), multi=False)
+        G = raw_graph.copy()
+    else:
+        # Fallback pure-NetworkX graph constructor using 8-connectivity
+        G = nx.Graph()
+        points = np.argwhere(skeleton > 0)
+        h, w = skeleton.shape
+
+        for r, c in points:
+            node_id = int(r * w + c)
+            G.add_node(node_id, o=np.array([r, c], dtype=np.uint16), pts=np.array([[r, c]]))
+            # Connect to 8-neighbors
+            for dr, dc in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and skeleton[nr, nc]:
+                    neighbor_id = int(nr * w + nc)
+                    dist = np.hypot(dr, dc)
+                    G.add_edge(node_id, neighbor_id, pts=np.array([[r, c], [nr, nc]]), weight=dist)
+
+    # Clean up spurious isolated nodes (degree == 0)
+    remove_isolated_nodes(G)
+
+    # Compute Betweenness Centrality for critical infrastructure identification
+    # Algorithmic optimization: sample pivot nodes if graph is large
+    sample_size = min(len(G.nodes()), 150)
+    centrality_dict = nx.betweenness_centrality(G, k=sample_size, weight="weight")
+    
+    # Determine gatekeeper threshold (90th percentile)
+    c_values = list(centrality_dict.values())
+    threshold = float(np.percentile(c_values, 90)) if c_values else 0.0
+
+    # Enrich nodes with centrality attributes
+    for n in G.nodes():
+        score = float(centrality_dict.get(n, 0.0))
+        G.nodes[n]["centrality"] = score
+        G.nodes[n]["is_gatekeeper"] = bool(score >= threshold)
+        G.nodes[n]["degree"] = int(G.degree(n))
+
+    # Enrich edges with cost map traversal weight and physical metric lengths
+    h, w = cost_map.shape
+    for u, v, data in G.edges(data=True):
+        pts = data.get("pts", [])
+        total_friction = 0.0
+        for pt in pts:
+            pr, pc = int(pt[0]), int(pt[1])
+            if 0 <= pr < h and 0 <= pc < w:
+                total_friction += float(cost_map[pr, pc])
+        
+        pixel_length = float(data.get("weight", len(pts)))
+        metric_length = pixel_length * DEFAULT_GSD
+        # Routing cost balances physical distance with friction surface
+        routing_weight = metric_length * (1.0 + 3.0 * (total_friction / max(len(pts), 1)))
+
+        data["routing_weight"] = float(routing_weight)
+        data["metric_length"] = float(metric_length)
+        data["friction_cost"] = float(total_friction)
+
+    return G
+
+
+def build_serialized_payloads(
+    G: nx.Graph,
+    cost_map: np.ndarray
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Serializes NetworkX graph to both:
+    1. A comprehensive Graph JSON structure with EPSG:4326 spherical coordinates
+    2. An RFC 7946 compliant GeoJSON FeatureCollection
+    """
+    # Clean up spurious nodes: remove all isolated nodes (degree == 0)
+    # We only want to send nodes that are actually connected to road edges
+    remove_isolated_nodes(G)
+
+    h, w = cost_map.shape
+    nodes_list = []
+    node_features = []
+
+    for n, data in G.nodes(data=True):
+        pt = data.get("o", [0, 0])
+        r, c = float(pt[0]), float(pt[1])
+        geo = pixel_to_coordinates(r, c, img_height=h, img_width=w)
+        
+        node_item = {
+            "id": int(n),
+            "pixel": geo["pixel"],
+            "utm": geo["utm"],
+            "coordinates": geo["coordinates"],  # [latitude, longitude] (Y, X)
+            "lat": geo["lat"],
+            "lon": geo["lon"],
+            "degree": data.get("degree", int(G.degree(n))),
+            "centrality": data.get("centrality", 0.0),
+            "is_gatekeeper": data.get("is_gatekeeper", False)
+        }
+        nodes_list.append(node_item)
+
+        node_features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": geo["coordinates"]
+            },
+            "properties": {
+                "id": int(n),
+                "type": "node",
+                "degree": node_item["degree"],
+                "centrality": node_item["centrality"],
+                "is_gatekeeper": node_item["is_gatekeeper"]
+            }
+        })
+
+    edges_list = []
+    edge_features = []
+
+    for idx, (u, v, data) in enumerate(G.edges(data=True)):
+        pts = data.get("pts", [])
+        line_coords_spherical = []
+        line_coords_metric = []
+        line_pixel_pts = []
+
+        for pt in pts:
+            pr, pc = float(pt[0]), float(pt[1])
+            geo = pixel_to_coordinates(pr, pc, img_height=h, img_width=w)
+            line_coords_spherical.append(geo["coordinates"])
+            line_coords_metric.append(geo["utm"])
+            line_pixel_pts.append(geo["pixel"])
+
+        # Fallback if pts is empty
+        if not line_coords_spherical:
+            u_pt = G.nodes[u].get("o", [0, 0])
+            v_pt = G.nodes[v].get("o", [0, 0])
+            geo_u = pixel_to_coordinates(u_pt[0], u_pt[1], img_height=h, img_width=w)
+            geo_v = pixel_to_coordinates(v_pt[0], v_pt[1], img_height=h, img_width=w)
+            line_coords_spherical = [geo_u["coordinates"], geo_v["coordinates"]]
+            line_coords_metric = [geo_u["utm"], geo_v["utm"]]
+            line_pixel_pts = [geo_u["pixel"], geo_v["pixel"]]
+
+        edge_item = {
+            "id": idx,
+            "source": int(u),
+            "target": int(v),
+            "weight_pixels": float(data.get("weight", len(pts))),
+            "weight_meters": float(data.get("metric_length", len(pts) * DEFAULT_GSD)),
+            "routing_weight": float(data.get("routing_weight", 0.0)),
+            "friction_cost": float(data.get("friction_cost", 0.0)),
+            "coordinates": line_coords_spherical,  # [[lat, lon], ...] [latitude, longitude] (Y, X)
+            "metric_coordinates": line_coords_metric,  # [[x, y], ...] in EPSG:32643
+            "pixel_coordinates": line_pixel_pts
+        }
+        edges_list.append(edge_item)
+
+        edge_features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": line_coords_spherical
+            },
+            "properties": {
+                "id": idx,
+                "source": int(u),
+                "target": int(v),
+                "weight_meters": edge_item["weight_meters"],
+                "routing_weight": edge_item["routing_weight"],
+                "friction_cost": edge_item["friction_cost"]
+            }
+        })
+
+    connected_components = list(nx.connected_components(G))
+    top_gatekeeper = max(nodes_list, key=lambda x: x["centrality"]) if nodes_list else None
+
+    graph_payload = {
+        "status": "success",
+        "crs": "EPSG:4326",
+        "source_crs": "EPSG:32643",
+        "metadata": {
+            "node_count": len(nodes_list),
+            "edge_count": len(edges_list),
+            "connected_components": len(connected_components),
+            "largest_component_size": max(len(c) for c in connected_components) if connected_components else 0,
+            "top_choke_point": top_gatekeeper["id"] if top_gatekeeper else None,
+            "top_centrality": top_gatekeeper["centrality"] if top_gatekeeper else 0.0,
+            "utm_bounds": {
+                "min_easting": DEFAULT_ORIGIN_UTM_X,
+                "max_easting": DEFAULT_MAX_UTM_X,
+                "min_northing": DEFAULT_MIN_UTM_Y,
+                "max_northing": DEFAULT_ORIGIN_UTM_Y
+            },
+            "wgs84_bounds": {
+                "west": float(transformer.transform(DEFAULT_ORIGIN_UTM_X, DEFAULT_MIN_UTM_Y)[0]),
+                "east": float(transformer.transform(DEFAULT_MAX_UTM_X, DEFAULT_ORIGIN_UTM_Y)[0]),
+                "south": float(transformer.transform(DEFAULT_ORIGIN_UTM_X, DEFAULT_MIN_UTM_Y)[1]),
+                "north": float(transformer.transform(DEFAULT_MAX_UTM_X, DEFAULT_ORIGIN_UTM_Y)[1])
+            },
+            "leaflet_bounds": [
+                [float(transformer.transform(DEFAULT_ORIGIN_UTM_X, DEFAULT_MIN_UTM_Y)[1]),
+                 float(transformer.transform(DEFAULT_ORIGIN_UTM_X, DEFAULT_MIN_UTM_Y)[0])],
+                [float(transformer.transform(DEFAULT_MAX_UTM_X, DEFAULT_ORIGIN_UTM_Y)[1]),
+                 float(transformer.transform(DEFAULT_MAX_UTM_X, DEFAULT_ORIGIN_UTM_Y)[0])]
+            ]
+        },
+        "nodes": nodes_list,
+        "edges": edges_list
+    }
+
+    geojson_payload = {
+        "type": "FeatureCollection",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}
+        },
+        "metadata": graph_payload["metadata"],
+        "features": edge_features + node_features
+    }
+
+    return graph_payload, geojson_payload
+
+
+def convert_graph_to_geojson(
+    G: Optional[nx.Graph] = None,
+    cost_map: Optional[np.ndarray] = None
+) -> Dict[str, Any]:
+    """
+    Converts a NetworkX graph to an RFC 7946 compliant GeoJSON FeatureCollection.
+    Includes a cleaning step that removes all isolated nodes (degree of 0)
+    before conversion, ensuring only nodes connected to road edges are sent.
+    """
+    target_g = (G if G is not None else network_graph).copy()
+    cm = cost_map if cost_map is not None else cost_map_data
+    remove_isolated_nodes(target_g)
+    _, geojson_payload = build_serialized_payloads(target_g, cm)
+    return geojson_payload
+
+
+def initialize_data_and_graph():
+    """Loads numpy arrays and builds the graph during startup."""
+    global skeleton_data, cost_map_data, network_graph, cached_graph_payload, cached_geojson_payload
+
+    if not SKELETON_PATH.exists() or not COST_MAP_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing required data files. Checked: {SKELETON_PATH} and {COST_MAP_PATH}"
+        )
+
+    print(f"Loading skeleton from {SKELETON_PATH}...")
+    skeleton_data = np.load(SKELETON_PATH)
+    print(f"Loading cost map from {COST_MAP_PATH}...")
+    cost_map_data = np.load(COST_MAP_PATH)
+
+    print(f"Skeleton shape: {skeleton_data.shape}, Cost map shape: {cost_map_data.shape}")
+    print("Building topological graph with NetworkX...")
+    network_graph = build_graph_from_skeleton(skeleton_data, cost_map_data)
+    print(f"Graph constructed successfully with {len(network_graph.nodes())} nodes and {len(network_graph.edges())} edges.")
+
+    print("Pre-serializing graph and GeoJSON payloads with pyproj coordinate transformation...")
+    cached_graph_payload, cached_geojson_payload = build_serialized_payloads(network_graph, cost_map_data)
+    print("Initialization complete! Ready to serve requests.")
+
+
+# ---------------------------------------------------------------------------
+# REST API Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def read_root():
+    """Root endpoint welcoming users and providing navigation links."""
+    return {
+        "project": "GeoResilience AI",
+        "message": "FastAPI Graph Engine is running.",
+        "documentation": "/docs",
+        "endpoints": {
+            "graph": "/api/graph",
+            "geojson": "/api/graph/geojson",
+            "health": "/api/health",
+            "stats": "/api/stats",
+            "shortest_path": "/api/shortest-path?source=0&target=1",
+            "disaster_simulation": "/api/simulate-disaster"
+        }
+    }
+
+
+@app.get("/api/health")
+def health_check():
+    """Health check endpoint showing memory, graph status, and loaded files."""
+    return {
+        "status": "healthy",
+        "files_loaded": {
+            "skeleton": str(SKELETON_PATH),
+            "cost_map": str(COST_MAP_PATH)
+        },
+        "shapes": {
+            "skeleton": list(skeleton_data.shape) if skeleton_data is not None else None,
+            "cost_map": list(cost_map_data.shape) if cost_map_data is not None else None
+        },
+        "graph_nodes": len(network_graph.nodes()) if network_graph else 0,
+        "graph_edges": len(network_graph.edges()) if network_graph else 0
+    }
+
+
+@app.get("/api/graph")
+@app.get("/graph")
+def get_graph(downsample: int = Query(1, ge=1, le=50, description="Downsample edge points for lower bandwidth")):
+    """
+    Returns the complete graph (nodes and edges) as JSON.
+    Coordinates are transformed from metric EPSG:32643 to spherical EPSG:4326 via pyproj.
+    """
+    if cached_graph_payload is None:
+        raise HTTPException(status_code=503, detail="Graph not initialized yet.")
+
+    if downsample == 1:
+        return cached_graph_payload
+
+    # Downsampled edge points if requested
+    payload_copy = dict(cached_graph_payload)
+    downsampled_edges = []
+    for edge in cached_graph_payload["edges"]:
+        e_copy = dict(edge)
+        coords = edge["coordinates"]
+        if len(coords) > 2:
+            sampled = coords[::downsample]
+            if sampled[-1] != coords[-1]:
+                sampled.append(coords[-1])
+            e_copy["coordinates"] = sampled
+        downsampled_edges.append(e_copy)
+
+    payload_copy["edges"] = downsampled_edges
+    return payload_copy
+
+
+@app.get("/api/graph/geojson")
+@app.get("/graph/geojson")
+def get_graph_geojson():
+    """
+    Returns the graph formatted as an RFC 7946 standard GeoJSON FeatureCollection.
+    Ready for direct rendering in MapLibre, Leaflet, Mapbox, or GIS applications.
+    """
+    if cached_geojson_payload is None:
+        raise HTTPException(status_code=503, detail="GeoJSON not initialized yet.")
+    return cached_geojson_payload
+
+
+@app.get("/api/stats")
+def get_system_stats():
+    """Provides statistical metrics for road cost map and topological network."""
+    if cost_map_data is None or network_graph is None:
+        raise HTTPException(status_code=503, detail="System not initialized.")
+
+    components = list(nx.connected_components(network_graph))
+    degrees = [network_graph.degree(n) for n in network_graph.nodes()]
+
+    return {
+        "cost_map": {
+            "min_friction": float(cost_map_data.min()),
+            "max_friction": float(cost_map_data.max()),
+            "mean_friction": float(cost_map_data.mean()),
+            "shape": list(cost_map_data.shape)
+        },
+        "network": {
+            "total_nodes": len(network_graph.nodes()),
+            "total_edges": len(network_graph.edges()),
+            "average_degree": float(np.mean(degrees)) if degrees else 0.0,
+            "connected_components": len(components),
+            "isolated_subgraphs": sum(1 for c in components if len(c) == 1)
+        }
+    }
+
+
+@app.get("/api/shortest-path")
+def calculate_shortest_path(source: int, target: int, weight: str = Query("routing_weight", enum=["routing_weight", "metric_length", "weight"])):
+    """
+    Calculates the shortest or least-cost route between two nodes.
+    Weight options: 'routing_weight' (friction-aware), 'metric_length' (physical meters).
+    """
+    if network_graph is None:
+        raise HTTPException(status_code=503, detail="Graph not initialized.")
+
+    if not network_graph.has_node(source) or not network_graph.has_node(target):
+        raise HTTPException(
+            status_code=404,
+            detail=f"One or both nodes not found. Available nodes: 0 to {max(network_graph.nodes())}"
+        )
+
+    try:
+        path = nx.shortest_path(network_graph, source=source, target=target, weight=weight)
+        path_length = nx.shortest_path_length(network_graph, source=source, target=target, weight=weight)
+        
+        # Convert path nodes to EPSG:4326 coordinates
+        path_coords = []
+        h, w = cost_map_data.shape
+        for node in path:
+            pt = network_graph.nodes[node]["o"]
+            geo = pixel_to_coordinates(pt[0], pt[1], img_height=h, img_width=w)
+            path_coords.append(geo["coordinates"])
+
+        return {
+            "status": "success",
+            "source": source,
+            "target": target,
+            "weight_metric": weight,
+            "total_cost": float(path_length),
+            "hops": len(path) - 1,
+            "node_path": path,
+            "coordinates": path_coords
+        }
+    except nx.NetworkXNoPath:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No connected path exists between node {source} and node {target} (isolated topological components)."
+        )
+
+
+@app.post("/api/simulate-disaster")
+def simulate_disaster(
+    target_node: Optional[int] = Query(None, description="Target node ID for ablation"),
+    radius_meters: Optional[float] = Query(None, description="Destruction radius around node in meters")
+):
+    """
+    Simulates disaster destruction (targeted ablation or flood radius)
+    and reports topological fractures and remaining connected components.
+    """
+    if network_graph is None:
+        raise HTTPException(status_code=503, detail="Graph not initialized.")
+
+    G_sim = network_graph.copy()
+    destroyed_nodes = []
+
+    if target_node is not None:
+        if not G_sim.has_node(target_node):
+            raise HTTPException(status_code=404, detail=f"Target node {target_node} does not exist.")
+
+        if radius_meters is None or radius_meters <= 0:
+            # Single node targeted destruction
+            destroyed_nodes.append(target_node)
+            G_sim.remove_node(target_node)
+        else:
+            # Flood radius destruction in meters
+            center_px = np.array(network_graph.nodes[target_node]["o"])
+            rad_px = radius_meters / DEFAULT_GSD
+            for n in list(G_sim.nodes()):
+                n_px = np.array(network_graph.nodes[n]["o"])
+                if np.linalg.norm(n_px - center_px) <= rad_px:
+                    destroyed_nodes.append(n)
+            G_sim.remove_nodes_from(destroyed_nodes)
+
+    components_after = list(nx.connected_components(G_sim))
+    initial_components = nx.number_connected_components(network_graph)
+    is_partitioned = len(components_after) > initial_components
+
+    return {
+        "status": "success",
+        "destroyed_nodes_count": len(destroyed_nodes),
+        "destroyed_nodes": destroyed_nodes,
+        "remaining_nodes": len(G_sim.nodes()),
+        "remaining_edges": len(G_sim.edges()),
+        "initial_connected_components": initial_components,
+        "current_connected_components": len(components_after),
+        "network_fractured": is_partitioned,
+        "diagnosis": (
+            f"CRITICAL FAILURE: Network fractured into {len(components_after)} disconnected islands!"
+            if is_partitioned
+            else "RESILIENT: Redundant pathways preserved reachability."
+        )
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+================================================================================
+FILE: backend/requirements.txt
+================================================================================
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+numpy>=1.24.0
+networkx>=3.0
+pyproj>=3.5.0
+scipy>=1.10.0
+sknw>=0.15
+
+
+================================================================================
+FILE: frontend/.oxlintrc.json
+================================================================================
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "oxc"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+  }
+}
+
+
+================================================================================
+FILE: frontend/index.html
+================================================================================
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GeoResilience AI | Spatial Graph & Road Network Dashboard</title>
+    <meta name="description" content="Interactive urban mobility and topological road network resilience dashboard powered by FastAPI, NetworkX, and React Leaflet." />
+    <!-- Google Fonts: Inter & JetBrains Mono -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+================================================================================
+FILE: frontend/package.json
+================================================================================
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.20.0",
+    "leaflet": "^1.9.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-leaflet": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "vite": "^8.3.0"
+  }
+}
+
+
+================================================================================
+FILE: frontend/vite.config.js
+================================================================================
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    host: '0.0.0.0',
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      }
+    }
+  }
+})
+
+
+================================================================================
+FILE: frontend/src/App.css
+================================================================================
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+.counter {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+  margin-bottom: 24px;
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.hero {
+  position: relative;
+
+  .base,
+  .framework,
+  .vite {
+    inset-inline: 0;
+    margin: 0 auto;
+  }
+
+  .base {
+    width: 170px;
+    position: relative;
+    z-index: 0;
+  }
+
+  .framework,
+  .vite {
+    position: absolute;
+  }
+
+  .framework {
+    z-index: 1;
+    top: 34px;
+    height: 28px;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg) scale(1.4);
+  }
+
+  .vite {
+    z-index: 0;
+    top: 107px;
+    height: 26px;
+    width: auto;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg) scale(0.8);
+  }
+}
+
+#center {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+  place-content: center;
+  place-items: center;
+  flex-grow: 1;
+
+  @media (max-width: 1024px) {
+    padding: 32px 20px 24px;
+    gap: 18px;
+  }
+}
+
+#next-steps {
+  display: flex;
+  border-top: 1px solid var(--border);
+  text-align: left;
+
+  &>div {
+    flex: 1 1 0;
+    padding: 32px;
+
+    @media (max-width: 1024px) {
+      padding: 24px 20px;
+    }
+  }
+
+  .icon {
+    margin-bottom: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  @media (max-width: 1024px) {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+#docs {
+  border-right: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+#next-steps ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  margin: 32px 0 0;
+
+  .logo {
+    height: 18px;
+  }
+
+  a {
+    color: var(--text-h);
+    font-size: 16px;
+    border-radius: 6px;
+    background: var(--social-bg);
+    display: flex;
+    padding: 6px 12px;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    transition: box-shadow 0.3s;
+
+    &:hover {
+      box-shadow: var(--shadow);
+    }
+
+    .button-icon {
+      height: 18px;
+      width: 18px;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+
+    li {
+      flex: 1 1 calc(50% - 8px);
+    }
+
+    a {
+      width: 100%;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+  }
+}
+
+#spacer {
+  height: 88px;
+  border-top: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    height: 48px;
+  }
+}
+
+.ticks {
+  position: relative;
+  width: 100%;
+
+  &::before,
+  &::after {
+    content: '';
+    position: absolute;
+    top: -4.5px;
+    border: 5px solid transparent;
+  }
+
+  &::before {
+    left: 0;
+    border-left-color: var(--border);
+  }
+
+  &::after {
+    right: 0;
+    border-right-color: var(--border);
+  }
+}
+
+================================================================================
+FILE: frontend/src/App.jsx
+================================================================================
+import React, { useState, useEffect, useMemo } from 'react';
+import { MapContainer, TileLayer, Polyline, CircleMarker, Popup, Tooltip, useMap } from 'react-leaflet';
+import L from 'leaflet';
+import axios from 'axios';
+import 'leaflet/dist/leaflet.css';
+import './App.css';
+
+const API_BASE = 'http://localhost:8000';
+
+// Component to automatically calculate bounds of incoming GeoJSON network and center map using map.fitBounds()
+export function GeoJsonBoundsFitter({ geoJsonData, graphData }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!map) return;
+
+    // 1. Calculate bounds using Leaflet's L.geoJSON if GeoJSON network is available
+    if (geoJsonData && geoJsonData.features && geoJsonData.features.length > 0) {
+      const geoLayer = L.geoJSON(geoJsonData, {
+        coordsToLatLng: (coords) => {
+          // Backend pyproj returns [latitude, longitude] (Y, X)
+          // Ensure [latitude, longitude] order for Leaflet (lat ~ 18.98, lon ~ 72.85)
+          const lat = coords[0] < coords[1] ? coords[0] : coords[1];
+          const lon = coords[0] < coords[1] ? coords[1] : coords[0];
+          return L.latLng(lat, lon);
+        }
+      });
+      const bounds = geoLayer.getBounds();
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 19, animate: true });
+        return;
+      }
+    }
+
+    // 2. Direct fallback using graphData metadata / nodes if GeoJSON is still loading
+    if (graphData?.metadata?.leaflet_bounds) {
+      map.fitBounds(graphData.metadata.leaflet_bounds, { padding: [50, 50], maxZoom: 19, animate: true });
+    } else if (graphData?.nodes && graphData.nodes.length > 0) {
+      const bounds = L.latLngBounds([]);
+      graphData.nodes.forEach(node => {
+        if (node.lat != null && node.lon != null) {
+          bounds.extend([node.lat, node.lon]);
+        }
+      });
+      if (graphData.edges) {
+        graphData.edges.forEach(edge => {
+          edge.coordinates?.forEach(pt => {
+            const lat = pt[0] < pt[1] ? pt[0] : pt[1];
+            const lon = pt[0] < pt[1] ? pt[1] : pt[0];
+            bounds.extend([lat, lon]);
+          });
+        });
+      }
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 19, animate: true });
+      }
+    }
+  }, [geoJsonData, graphData, map]);
+
+  return null;
+}
+
+// Backward-compatible alias
+export const MapBoundsFitter = GeoJsonBoundsFitter;
+
+// Helper component to fix Leaflet tile rendering issues on container resize / mount
+function FixMapResize() {
+  const map = useMap();
+  useEffect(() => {
+    const handleResize = () => map.invalidateSize();
+    window.addEventListener('resize', handleResize);
+    const timer1 = setTimeout(() => map.invalidateSize(), 200);
+    const timer2 = setTimeout(() => map.invalidateSize(), 800);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      clearTimeout(timer1);
+      clearTimeout(timer2);
+    };
+  }, [map]);
+  return null;
+}
+
+export default function App() {
+  const [graphData, setGraphData] = useState(null);
+  const [geoJsonData, setGeoJsonData] = useState(null);
+  const [statsData, setStatsData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [backendOnline, setBackendOnline] = useState(false);
+
+  // Visualization filters & toggles
+  const [showEdges, setShowEdges] = useState(true);
+  const [showNodes, setShowNodes] = useState(true);
+  const [highlightGatekeepers, setHighlightGatekeepers] = useState(true);
+
+  // Disaster Simulation State
+  const [ablatedNodes, setAblatedNodes] = useState([]);
+  const [simulationResult, setSimulationResult] = useState(null);
+  const [selectedNodeId, setSelectedNodeId] = useState('');
+  const [simulating, setSimulating] = useState(false);
+
+  // Inspector Details
+  const [inspectedEntity, setInspectedEntity] = useState(null);
+
+  // Fetch graph data and GeoJSON from FastAPI backend
+  const fetchGraph = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [graphRes, healthRes, geoJsonRes] = await Promise.all([
+        axios.get(`${API_BASE}/api/graph`),
+        axios.get(`${API_BASE}/api/health`),
+        axios.get(`${API_BASE}/api/graph/geojson`)
+      ]);
+
+      setGraphData(graphRes.data);
+      setGeoJsonData(geoJsonRes.data);
+      setBackendOnline(healthRes.data?.status === 'healthy');
+
+      // Select top choke point by default if available
+      if (graphRes.data?.metadata?.top_choke_point !== undefined) {
+        setSelectedNodeId(String(graphRes.data.metadata.top_choke_point));
+      }
+    } catch (err) {
+      console.error('Failed to fetch from backend:', err);
+      setError(err.message || 'Cannot reach FastAPI backend on http://localhost:8000');
+      setBackendOnline(false);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Fetch supplementary stats
+  const fetchStats = async () => {
+    try {
+      const res = await axios.get(`${API_BASE}/api/stats`);
+      setStatsData(res.data);
+    } catch {
+      // Non-critical endpoint
+    }
+  };
+
+  useEffect(() => {
+    fetchGraph();
+    fetchStats();
+  }, []);
+
+  // Compute bounding box for Leaflet: [[south, west], [north, east]]
+  const mapBounds = useMemo(() => {
+    if (!graphData || !graphData.nodes || graphData.nodes.length === 0) {
+      // Default to Mumbai AOI center
+      return [[18.979, 72.849], [18.986, 72.855]];
+    }
+    const lats = graphData.nodes.map(n => n.lat);
+    const lons = graphData.nodes.map(n => n.lon);
+    return [
+      [Math.min(...lats), Math.min(...lons)],
+      [Math.max(...lats), Math.max(...lons)]
+    ];
+  }, [graphData]);
+
+  // Center coordinate for Leaflet
+  const mapCenter = useMemo(() => {
+    if (!mapBounds) return [18.9823, 72.8520];
+    return [
+      (mapBounds[0][0] + mapBounds[1][0]) / 2,
+      (mapBounds[0][1] + mapBounds[1][1]) / 2
+    ];
+  }, [mapBounds]);
+
+  // Trigger Disaster Ablation directly on a node via Backend API
+  const triggerAblation = async (nodeId) => {
+    const targetId = nodeId !== undefined ? nodeId : selectedNodeId;
+    if (targetId === undefined || targetId === null || targetId === '') return;
+
+    setSelectedNodeId(String(targetId));
+    const targetNode = graphData?.nodes?.find(n => Number(n.id) === Number(targetId));
+    if (targetNode) {
+      setInspectedEntity({ type: 'node', ...targetNode });
+    }
+
+    setSimulating(true);
+    try {
+      const res = await axios.post(`${API_BASE}/api/simulate-disaster`, null, {
+        params: { target_node: parseInt(targetId, 10) }
+      });
+      setSimulationResult(res.data);
+      setAblatedNodes(prev => [...new Set([...prev, parseInt(targetId, 10)])]);
+    } catch (err) {
+      console.error('Simulation error:', err);
+      alert(`Simulation failed: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setSimulating(false);
+    }
+  };
+
+  const handleTriggerAblation = () => triggerAblation(selectedNodeId);
+
+  // Reset Disaster Simulation
+  const handleResetSimulation = () => {
+    setAblatedNodes([]);
+    setSimulationResult(null);
+  };
+
+  const totalNodes = graphData?.metadata?.node_count ?? graphData?.nodes?.length ?? 0;
+  const totalEdges = graphData?.metadata?.edge_count ?? graphData?.edges?.length ?? 0;
+  const connectedComponents = graphData?.metadata?.connected_components ?? 1;
+  const topChokePoint = graphData?.metadata?.top_choke_point ?? 'N/A';
+  const topCentrality = graphData?.metadata?.top_centrality?.toFixed(4) ?? '0.0000';
+
+  return (
+    <div className="dashboard-container" id="geo-resilience-dashboard">
+      {/* ----------------------------------------------------------------- */}
+      {/* SIDEBAR PANEL */}
+      {/* ----------------------------------------------------------------- */}
+      <aside className="sidebar" id="sidebar-panel">
+        <div className="sidebar-header">
+          <div className="brand-badge">
+            <span className="pulse-dot"></span>
+            GeoResilience AI &bull; ISRO
+          </div>
+          <h1 className="sidebar-title" id="dashboard-title">
+            <span>Urban Mobility</span>
+          </h1>
+          <p className="sidebar-subtitle">
+            Occlusion-robust topological road graph & resilience simulator
+          </p>
+
+          <div className={`backend-status-pill ${backendOnline ? 'online' : 'offline'}`} id="backend-status-indicator">
+            <span className="status-indicator">
+              <span className={`status-dot ${backendOnline ? 'online' : 'offline'}`}></span>
+              {backendOnline ? 'FastAPI Connected' : 'Backend Offline'}
+            </span>
+            <span style={{ opacity: 0.75 }}>:8000</span>
+          </div>
+        </div>
+
+        <div className="sidebar-body">
+          {/* SECTION: BASIC METRICS */}
+          <div>
+            <div className="section-label">
+              <span>Topological Graph Metrics</span>
+            </div>
+            <div className="metrics-grid">
+              <div className="metric-card nodes-card" id="metric-nodes-card">
+                <div className="metric-value" id="metric-total-nodes">{totalNodes}</div>
+                <div className="metric-title">Total Nodes</div>
+                <div className="metric-hint">Intersections & Terminals</div>
+              </div>
+
+              <div className="metric-card edges-card" id="metric-edges-card">
+                <div className="metric-value" id="metric-total-edges">{totalEdges}</div>
+                <div className="metric-title">Total Edges</div>
+                <div className="metric-hint">Routable Centerlines</div>
+              </div>
+
+              <div className="metric-card components-card" id="metric-components-card">
+                <div className="metric-value" id="metric-components-count">
+                  {simulationResult ? simulationResult.current_connected_components : connectedComponents}
+                </div>
+                <div className="metric-title">Partitions</div>
+                <div className="metric-hint">
+                  {simulationResult?.network_fractured ? 'Fractured Island Count' : 'Connected Components'}
+                </div>
+              </div>
+
+              <div className="metric-card choke-card" id="metric-choke-card">
+                <div className="metric-value" id="metric-top-chokepoint">#{topChokePoint}</div>
+                <div className="metric-title">Top Chokepoint</div>
+                <div className="metric-hint">Score: {topCentrality}</div>
+              </div>
+            </div>
+          </div>
+
+          {/* SECTION: DISASTER ABLATION STRESS TEST */}
+          <div className="panel-card" id="disaster-simulation-panel">
+            <div className="section-label" style={{ color: 'var(--neon-rose)' }}>
+              <span>Disaster Injection & Stress Test</span>
+            </div>
+            <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px', lineHeight: 1.4 }}>
+              Simulate flood or infrastructure destruction on critical gatekeeper nodes to test network fracturing.
+            </p>
+
+            <div style={{ marginBottom: '12px' }}>
+              <label htmlFor="select-target-node" style={{ display: 'block', fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '6px', fontWeight: 600 }}>
+                TARGET NODE FOR ABLATION
+              </label>
+              <select
+                id="select-target-node"
+                value={selectedNodeId}
+                onChange={(e) => setSelectedNodeId(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '9px 12px',
+                  borderRadius: '8px',
+                  background: 'var(--bg-input)',
+                  border: '1px solid var(--border-color)',
+                  color: '#fff',
+                  fontSize: '12px',
+                  fontFamily: 'var(--font-mono)',
+                  outline: 'none'
+                }}
+              >
+                {graphData?.nodes?.map(n => (
+                  <option key={n.id} value={n.id}>
+                    Node #{n.id} {n.is_gatekeeper ? '★ (Critical Chokepoint)' : ''} — Deg: {n.degree}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                id="btn-trigger-stress-test"
+                className="action-btn danger"
+                onClick={handleTriggerAblation}
+                disabled={simulating || !backendOnline}
+              >
+                {simulating ? 'Simulating...' : '⚡ Ablate Node'}
+              </button>
+
+              {ablatedNodes.length > 0 && (
+                <button
+                  id="btn-reset-simulation"
+                  className="action-btn secondary"
+                  onClick={handleResetSimulation}
+                  style={{ width: 'auto' }}
+                  title="Restore network graph"
+                >
+                  ↺ Reset
+                </button>
+              )}
+            </div>
+
+            {simulationResult && (
+              <div className={`alert-box ${simulationResult.network_fractured ? 'danger' : 'success'}`} id="simulation-diagnosis-alert">
+                <strong>{simulationResult.network_fractured ? '⚠️ NETWORK FRACTURED' : '✓ NETWORK RESILIENT'}</strong>
+                <div style={{ marginTop: '4px' }}>
+                  {simulationResult.diagnosis}
+                </div>
+                <div style={{ marginTop: '6px', fontSize: '11px', opacity: 0.9 }}>
+                  Ablated Node #{selectedNodeId} &bull; Partitions: {simulationResult.initial_connected_components} &rarr; {simulationResult.current_connected_components}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* SECTION: LAYER & VISUALIZATION CONTROLS */}
+          <div className="panel-card" id="layer-controls-panel">
+            <div className="section-label">
+              <span>Map Layer Controls</span>
+            </div>
+            <div className="controls-group">
+              <label className="control-toggle" htmlFor="toggle-edges">
+                <span className="toggle-label">
+                  <span style={{ display: 'inline-block', width: 14, height: 3, background: 'var(--neon-cyan)', borderRadius: 2 }}></span>
+                  Road Edges (Centerlines)
+                </span>
+                <span className="toggle-switch">
+                  <input
+                    id="toggle-edges"
+                    type="checkbox"
+                    checked={showEdges}
+                    onChange={(e) => setShowEdges(e.target.checked)}
+                  />
+                  <span className="slider"></span>
+                </span>
+              </label>
+
+              <label className="control-toggle" htmlFor="toggle-nodes">
+                <span className="toggle-label">
+                  <span style={{ display: 'inline-block', width: 8, height: 8, background: 'var(--neon-cyan)', borderRadius: '50%' }}></span>
+                  Graph Nodes (Intersections)
+                </span>
+                <span className="toggle-switch">
+                  <input
+                    id="toggle-nodes"
+                    type="checkbox"
+                    checked={showNodes}
+                    onChange={(e) => setShowNodes(e.target.checked)}
+                  />
+                  <span className="slider"></span>
+                </span>
+              </label>
+
+              <label className="control-toggle" htmlFor="toggle-gatekeepers">
+                <span className="toggle-label">
+                  <span style={{ display: 'inline-block', width: 8, height: 8, background: 'var(--neon-rose)', borderRadius: '50%' }}></span>
+                  Highlight Critical Gatekeepers
+                </span>
+                <span className="toggle-switch">
+                  <input
+                    id="toggle-gatekeepers"
+                    type="checkbox"
+                    checked={highlightGatekeepers}
+                    onChange={(e) => setHighlightGatekeepers(e.target.checked)}
+                  />
+                  <span className="slider"></span>
+                </span>
+              </label>
+            </div>
+
+            <div style={{ marginTop: '16px' }}>
+              <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '8px', fontWeight: 600 }}>
+                ACTIVE BASEMAP
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '9px 12px', background: 'var(--bg-input)', borderRadius: '8px', border: '1px solid var(--border-color)', fontSize: '12px' }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--neon-emerald)', display: 'inline-block' }}></span>
+                <span style={{ color: '#fff', fontWeight: 500 }}>Google Satellite Basemap</span>
+                <span style={{ marginLeft: 'auto', fontSize: '11px', color: 'var(--neon-cyan)', fontFamily: 'var(--font-mono)' }}>maxZoom: 20</span>
+              </div>
+            </div>
+          </div>
+
+          {/* SECTION: SPATIAL & CRS METADATA */}
+          <div className="panel-card" id="crs-metadata-panel">
+            <div className="section-label">
+              <span>Geospatial Transformation</span>
+            </div>
+            <table className="kv-table">
+              <tbody>
+                <tr>
+                  <td className="kv-key">Source Projection</td>
+                  <td className="kv-value"><span className="kv-badge">EPSG:32643 (UTM 43N)</span></td>
+                </tr>
+                <tr>
+                  <td className="kv-key">Target Display CRS</td>
+                  <td className="kv-value"><span className="kv-badge">EPSG:4326 (WGS84)</span></td>
+                </tr>
+                <tr>
+                  <td className="kv-key">Resolution (GSD)</td>
+                  <td className="kv-value">0.3077 m/px</td>
+                </tr>
+                <tr>
+                  <td className="kv-key">Target Region</td>
+                  <td className="kv-value">SpaceNet 5 (Mumbai AOI 8)</td>
+                </tr>
+                <tr>
+                  <td className="kv-key">Array Grid Shape</td>
+                  <td className="kv-value">1300 &times; 1300 px</td>
+                </tr>
+                {statsData?.cost_map?.mean_friction != null && (
+                  <tr>
+                    <td className="kv-key">Mean Cost Friction</td>
+                    <td className="kv-value">{statsData.cost_map.mean_friction.toFixed(3)}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* SECTION: SELECTED ENTITY INSPECTOR */}
+          {inspectedEntity && (
+            <div className="panel-card" id="inspected-entity-panel" style={{ borderColor: 'rgba(0, 229, 255, 0.4)' }}>
+              <div className="section-label" style={{ color: 'var(--neon-cyan)', display: 'flex', justifyContent: 'space-between' }}>
+                <span>Inspected {inspectedEntity.type === 'node' ? `Node #${inspectedEntity.id}` : `Edge #${inspectedEntity.id}`}</span>
+                <span
+                  style={{ cursor: 'pointer', opacity: 0.7 }}
+                  onClick={() => setInspectedEntity(null)}
+                  title="Close inspector"
+                >
+                  ✕
+                </span>
+              </div>
+
+              {inspectedEntity.type === 'node' ? (
+                <table className="kv-table">
+                  <tbody>
+                    <tr>
+                      <td className="kv-key">Latitude / Longitude</td>
+                      <td className="kv-value">{inspectedEntity.lat.toFixed(5)}, {inspectedEntity.lon.toFixed(5)}</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">Pixel (Y, X)</td>
+                      <td className="kv-value">[{inspectedEntity.pixel[0]}, {inspectedEntity.pixel[1]}]</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">UTM Metric Easting</td>
+                      <td className="kv-value">{inspectedEntity.utm[0].toFixed(1)} m</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">UTM Metric Northing</td>
+                      <td className="kv-value">{inspectedEntity.utm[1].toFixed(1)} m</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">Degree</td>
+                      <td className="kv-value">{inspectedEntity.degree}</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">Betweenness Centrality</td>
+                      <td className="kv-value">{inspectedEntity.centrality.toFixed(5)}</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">Gatekeeper Chokepoint</td>
+                      <td className="kv-value">
+                        {inspectedEntity.is_gatekeeper ? (
+                          <span style={{ color: 'var(--neon-rose)', fontWeight: 'bold' }}>YES (Critical)</span>
+                        ) : (
+                          'No'
+                        )}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              ) : (
+                <table className="kv-table">
+                  <tbody>
+                    <tr>
+                      <td className="kv-key">Source &rarr; Target</td>
+                      <td className="kv-value">Node #{inspectedEntity.source} &rarr; #{inspectedEntity.target}</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">Physical Length</td>
+                      <td className="kv-value">{inspectedEntity.weight_meters.toFixed(1)} meters</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">Routing Cost (Friction)</td>
+                      <td className="kv-value">{inspectedEntity.routing_weight.toFixed(2)}</td>
+                    </tr>
+                    <tr>
+                      <td className="kv-key">Intermediate Points</td>
+                      <td className="kv-value">{inspectedEntity.coordinates.length} pts</td>
+                    </tr>
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+
+          {/* REFRESH BUTTON */}
+          <button
+            id="btn-refresh-graph"
+            className="action-btn primary"
+            onClick={() => { fetchGraph(); fetchStats(); }}
+            disabled={loading}
+          >
+            {loading ? 'Fetching Graph...' : '↻ Refresh Network Data'}
+          </button>
+        </div>
+      </aside>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* MAIN MAP VIEWPORT */}
+      {/* ----------------------------------------------------------------- */}
+      <main className="map-viewport" id="map-viewport">
+        {/* Top floating pill */}
+        <div className="floating-topbar">
+          <div className="floating-pill" id="floating-info-pill">
+            <span style={{ color: 'var(--neon-cyan)', fontWeight: 600 }}>SpaceNet 5 Mumbai Road Network</span>
+            <span style={{ color: 'var(--border-color)' }}>|</span>
+            <span style={{ color: 'var(--text-secondary)' }}>
+              {graphData?.nodes?.length || 0} Nodes &bull; {graphData?.edges?.length || 0} Edges
+            </span>
+            {ablatedNodes.length > 0 && (
+              <>
+                <span style={{ color: 'var(--border-color)' }}>|</span>
+                <span style={{ color: 'var(--neon-rose)', fontWeight: 600 }}>
+                  Ablated: {ablatedNodes.join(', ')}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Floating Legend */}
+        <div className="map-legend" id="map-legend">
+          <div style={{ fontWeight: 700, color: '#fff', fontSize: '11px', textTransform: 'uppercase', marginBottom: 2 }}>
+            Map Legend
+          </div>
+          <div className="legend-item">
+            <span className="legend-color edge-normal"></span>
+            <span>Road Centerline (Metric Re-projected)</span>
+          </div>
+          <div className="legend-item">
+            <span className="legend-color node-normal"></span>
+            <span>Road Intersection / Junction</span>
+          </div>
+          <div className="legend-item">
+            <span className="legend-color node-gatekeeper"></span>
+            <span>Gatekeeper Node (High Centrality)</span>
+          </div>
+          {ablatedNodes.length > 0 && (
+            <div className="legend-item">
+              <span className="legend-color node-ablated"></span>
+              <span>Ablated / Destroyed Node</span>
+            </div>
+          )}
+        </div>
+
+        {/* Loading Overlay */}
+        {loading && (
+          <div className="loading-overlay" id="loading-overlay">
+            <div className="spinner"></div>
+            <div className="loading-text">
+              Fetching NetworkX graph from FastAPI backend (http://localhost:8000)...
+            </div>
+          </div>
+        )}
+
+        {/* Error Notification */}
+        {error && !loading && (
+          <div className="loading-overlay" id="error-overlay" style={{ background: 'rgba(15, 23, 42, 0.95)' }}>
+            <div style={{ maxWidth: 440, textAlign: 'center', padding: 24, background: '#1e293b', borderRadius: 16, border: '1px solid var(--border-danger)' }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}>⚠️</div>
+              <h2 style={{ fontSize: 18, color: '#fff', marginBottom: 8 }}>Unable to Connect to Backend</h2>
+              <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
+                {error}
+              </p>
+              <button
+                id="btn-retry-connect"
+                className="action-btn primary"
+                onClick={fetchGraph}
+              >
+                Retry Connection
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* REACT LEAFLET MAP */}
+        <MapContainer
+          center={mapCenter}
+          zoom={16}
+          scrollWheelZoom={true}
+          style={{ height: '100%', width: '100%' }}
+        >
+          {/* Fix Leaflet tile loading and container resize */}
+          <FixMapResize />
+
+          {/* Automatically calculate bounds of incoming GeoJSON network and center map using map.fitBounds() */}
+          <GeoJsonBoundsFitter geoJsonData={geoJsonData} graphData={graphData} />
+
+          {/* Google Satellite Basemap TileLayer */}
+          <TileLayer
+            url="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
+            maxZoom={20}
+            attribution="&copy; Google Maps"
+          />
+
+          {/* ROAD EDGES OVERLAY */}
+          {showEdges && graphData?.edges?.map((edge) => {
+            // Leaflet expects [latitude, longitude] (Y, X) tuples
+            // Backend pyproj returns [latitude, longitude] (Y, X)
+            const positions = edge.coordinates.map(pt => {
+              const lat = pt[0] < pt[1] ? pt[0] : pt[1];
+              const lon = pt[0] < pt[1] ? pt[1] : pt[0];
+              return [lat, lon];
+            });
+            const isConnectedToAblated = ablatedNodes.includes(edge.source) || ablatedNodes.includes(edge.target);
+
+            return (
+              <Polyline
+                key={`edge-${edge.id}`}
+                positions={positions}
+                pathOptions={{
+                  color: isConnectedToAblated ? '#475569' : '#00e5ff',
+                  weight: isConnectedToAblated ? 1.5 : 3,
+                  opacity: isConnectedToAblated ? 0.35 : 0.85,
+                  dashArray: isConnectedToAblated ? '4, 4' : null,
+                  lineCap: 'round',
+                  lineJoin: 'round'
+                }}
+                eventHandlers={{
+                  click: () => {
+                    setInspectedEntity({ type: 'edge', ...edge });
+                  }
+                }}
+              >
+                <Tooltip sticky>
+                  <div>
+                    <strong>Edge #{edge.id}</strong> ({edge.source} &rarr; {edge.target})<br />
+                    Length: {edge.weight_meters.toFixed(1)}m<br />
+                    Routing Cost: {edge.routing_weight.toFixed(2)}
+                  </div>
+                </Tooltip>
+              </Polyline>
+            );
+          })}
+
+          {/* ROAD NODES OVERLAY */}
+          {showNodes && graphData?.nodes?.map((node) => {
+            const isAblated = ablatedNodes.includes(node.id);
+            const isGatekeeper = highlightGatekeepers && node.is_gatekeeper;
+
+            // Radius scales with centrality
+            const radius = isAblated ? 8 : (isGatekeeper ? 9 : 5);
+            const fillColor = isAblated
+              ? '#fbbf24'
+              : (isGatekeeper ? '#f43f5e' : '#00e5ff');
+
+            return (
+              <CircleMarker
+                key={`node-${node.id}`}
+                center={[node.lat, node.lon]}
+                radius={radius}
+                pathOptions={{
+                  fillColor: fillColor,
+                  fillOpacity: isAblated ? 0.9 : (isGatekeeper ? 0.95 : 0.75),
+                  color: '#ffffff',
+                  weight: isGatekeeper ? 2 : 1,
+                  opacity: 1
+                }}
+                eventHandlers={{
+                  click: () => triggerAblation(node.id)
+                }}
+              >
+                <Popup>
+                  <div className="custom-popup">
+                    <div className="custom-popup-title">
+                      <span>Node #{node.id}</span>
+                      {isGatekeeper && (
+                        <span style={{ fontSize: 10, background: 'rgba(244, 63, 94, 0.2)', color: '#f43f5e', padding: '2px 6px', borderRadius: 4 }}>
+                          GATEKEEPER
+                        </span>
+                      )}
+                    </div>
+                    <div className="custom-popup-row">
+                      <span>Coordinates:</span>
+                      <span>{node.lat.toFixed(5)}, {node.lon.toFixed(5)}</span>
+                    </div>
+                    <div className="custom-popup-row">
+                      <span>Pixel:</span>
+                      <span>[{node.pixel[0]}, {node.pixel[1]}]</span>
+                    </div>
+                    <div className="custom-popup-row">
+                      <span>Degree:</span>
+                      <span>{node.degree}</span>
+                    </div>
+                    <div className="custom-popup-row">
+                      <span>Centrality:</span>
+                      <span>{node.centrality.toFixed(4)}</span>
+                    </div>
+                  </div>
+                </Popup>
+
+                <Tooltip direction="top" offset={[0, -5]}>
+                  <span>
+                    Node #{node.id} {isGatekeeper ? '★' : ''} (Deg: {node.degree})
+                  </span>
+                </Tooltip>
+              </CircleMarker>
+            );
+          })}
+        </MapContainer>
+      </main>
+    </div>
+  );
+}
+
+
+================================================================================
+FILE: frontend/src/index.css
+================================================================================
+:root {
+  --bg-dark: #080b11;
+  --bg-sidebar: rgba(13, 17, 27, 0.88);
+  --bg-card: rgba(21, 28, 44, 0.65);
+  --bg-card-hover: rgba(30, 41, 64, 0.85);
+  --bg-input: #0c101a;
+
+  --border-color: rgba(255, 255, 255, 0.09);
+  --border-glow: rgba(0, 229, 255, 0.35);
+  --border-danger: rgba(244, 63, 94, 0.4);
+
+  --text-main: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+
+  --neon-cyan: #00e5ff;
+  --neon-emerald: #10b981;
+  --neon-amber: #f59e0b;
+  --neon-rose: #f43f5e;
+  --neon-purple: #a855f7;
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --shadow-lg: 0 10px 30px -5px rgba(0, 0, 0, 0.6), 0 0 1px 1px rgba(255, 255, 255, 0.05);
+  --shadow-glow: 0 0 20px rgba(0, 229, 255, 0.2);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  display: flex;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 229, 255, 0.4);
+}
+
+/* App Layout */
+.dashboard-container {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Sidebar */
+.sidebar {
+  width: 400px;
+  min-width: 400px;
+  height: 100%;
+  background: var(--bg-sidebar);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  z-index: 1000;
+  overflow-y: auto;
+  box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+}
+
+/* Sidebar Header */
+.sidebar-header {
+  padding: 24px 20px 18px 20px;
+  border-bottom: 1px solid var(--border-color);
+  background: linear-gradient(180deg, rgba(0, 229, 255, 0.04) 0%, transparent 100%);
+}
+
+.brand-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(0, 229, 255, 0.1);
+  border: 1px solid rgba(0, 229, 255, 0.25);
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 10px;
+}
+
+.brand-badge .pulse-dot {
+  width: 6px;
+  height: 6px;
+  background-color: var(--neon-cyan);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--neon-cyan);
+  animation: pulse-glow 2s infinite;
+}
+
+@keyframes pulse-glow {
+  0% {
+    transform: scale(0.95);
+    opacity: 0.8;
+  }
+
+  50% {
+    transform: scale(1.3);
+    opacity: 1;
+  }
+
+  100% {
+    transform: scale(0.95);
+    opacity: 0.8;
+  }
+}
+
+.sidebar-title {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-subtitle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+/* Backend Connection Status Pill */
+.backend-status-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-color);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.backend-status-pill.online {
+  border-color: rgba(16, 185, 129, 0.3);
+  color: var(--neon-emerald);
+}
+
+.backend-status-pill.offline {
+  border-color: rgba(244, 63, 94, 0.3);
+  color: var(--neon-rose);
+}
+
+.status-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.status-dot.online {
+  background: var(--neon-emerald);
+  box-shadow: 0 0 8px var(--neon-emerald);
+}
+
+.status-dot.offline {
+  background: var(--neon-rose);
+  box-shadow: 0 0 8px var(--neon-rose);
+}
+
+/* Sidebar Content */
+.sidebar-body {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  flex: 1;
+}
+
+/* Metrics Section */
+.section-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.metric-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 14px 16px;
+  transition: all 0.25s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.metric-card:hover {
+  background: var(--bg-card-hover);
+  border-color: rgba(255, 255, 255, 0.15);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.4);
+}
+
+.metric-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 3px;
+  height: 100%;
+  background: var(--accent-bar, var(--neon-cyan));
+  opacity: 0.75;
+}
+
+.metric-card.nodes-card {
+  --accent-bar: var(--neon-cyan);
+}
+
+.metric-card.edges-card {
+  --accent-bar: var(--neon-emerald);
+}
+
+.metric-card.components-card {
+  --accent-bar: var(--neon-purple);
+}
+
+.metric-card.choke-card {
+  --accent-bar: var(--neon-rose);
+}
+
+.metric-value {
+  font-size: 26px;
+  font-weight: 800;
+  color: #fff;
+  font-family: var(--font-mono);
+  line-height: 1.1;
+}
+
+.metric-title {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-top: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.metric-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* Card Container */
+.panel-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 16px;
+  transition: border-color 0.2s ease;
+}
+
+.panel-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+/* Layer & Visualization Controls */
+.controls-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.control-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.toggle-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-main);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #232b3e;
+  transition: .3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 22px;
+  border: 1px solid var(--border-color);
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background-color: #94a3b8;
+  transition: .3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 50%;
+}
+
+input:checked+.slider {
+  background-color: rgba(0, 229, 255, 0.3);
+  border-color: var(--neon-cyan);
+}
+
+input:checked+.slider:before {
+  transform: translateX(18px);
+  background-color: var(--neon-cyan);
+  box-shadow: 0 0 8px var(--neon-cyan);
+}
+
+/* Spatial Details Table / Key-Value */
+.kv-table {
+  width: 100%;
+  font-size: 12px;
+  border-collapse: collapse;
+}
+
+.kv-table tr {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.kv-table tr:last-child {
+  border-bottom: none;
+}
+
+.kv-table td {
+  padding: 7px 0;
+}
+
+.kv-key {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.kv-value {
+  color: #fff;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.kv-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(0, 229, 255, 0.12);
+  color: var(--neon-cyan);
+  border: 1px solid rgba(0, 229, 255, 0.25);
+}
+
+/* Action Buttons */
+.action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: 1px solid transparent;
+  outline: none;
+}
+
+.action-btn.primary {
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.2) 0%, rgba(16, 185, 129, 0.2) 100%);
+  border-color: var(--neon-cyan);
+  color: #fff;
+  box-shadow: 0 4px 15px rgba(0, 229, 255, 0.15);
+}
+
+.action-btn.primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.35) 0%, rgba(16, 185, 129, 0.35) 100%);
+  box-shadow: 0 4px 20px rgba(0, 229, 255, 0.3);
+  transform: translateY(-1px);
+}
+
+.action-btn.danger {
+  background: linear-gradient(135deg, rgba(244, 63, 94, 0.2) 0%, rgba(239, 68, 68, 0.2) 100%);
+  border-color: var(--neon-rose);
+  color: #fff;
+}
+
+.action-btn.danger:hover:not(:disabled) {
+  background: linear-gradient(135deg, rgba(244, 63, 94, 0.35) 0%, rgba(239, 68, 68, 0.35) 100%);
+  box-shadow: 0 4px 20px rgba(244, 63, 94, 0.3);
+  transform: translateY(-1px);
+}
+
+.action-btn.secondary {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--border-color);
+  color: var(--text-secondary);
+}
+
+.action-btn.secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+/* Stress Test / Ablation Alert */
+.alert-box {
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-top: 10px;
+}
+
+.alert-box.danger {
+  background: rgba(244, 63, 94, 0.12);
+  border: 1px solid var(--border-danger);
+  color: #fda4af;
+}
+
+.alert-box.success {
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  color: #6ee7b7;
+}
+
+/* Map Container */
+.map-viewport {
+  flex: 1;
+  height: 100%;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  background: #06080d;
+}
+
+.leaflet-container {
+  height: 100% !important;
+  width: 100% !important;
+  background: #080b11 !important;
+}
+
+/* Map Floating Overlays */
+.floating-topbar {
+  position: absolute;
+  top: 18px;
+  left: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  pointer-events: none;
+}
+
+.floating-pill {
+  pointer-events: auto;
+  background: rgba(13, 17, 27, 0.85);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  padding: 8px 16px;
+  border-radius: 30px;
+  font-size: 12px;
+  color: var(--text-main);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.map-legend {
+  position: absolute;
+  bottom: 24px;
+  right: 24px;
+  z-index: 1000;
+  background: rgba(13, 17, 27, 0.9);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  padding: 12px 16px;
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+}
+
+.legend-color {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+
+.legend-color.edge-normal {
+  background: #00e5ff;
+  height: 3px;
+  width: 18px;
+}
+
+.legend-color.node-normal {
+  background: #00e5ff;
+  border-radius: 50%;
+}
+
+.legend-color.node-gatekeeper {
+  background: #f43f5e;
+  border-radius: 50%;
+  box-shadow: 0 0 6px #f43f5e;
+}
+
+.legend-color.node-ablated {
+  background: #fbbf24;
+  border-radius: 50%;
+}
+
+/* Custom Leaflet Popup */
+.leaflet-popup-content-wrapper {
+  background: rgba(17, 24, 39, 0.95) !important;
+  color: #fff !important;
+  border: 1px solid var(--border-color) !important;
+  backdrop-filter: blur(16px) !important;
+  border-radius: 12px !important;
+  box-shadow: var(--shadow-lg) !important;
+  padding: 4px !important;
+}
+
+.leaflet-popup-tip {
+  background: rgba(17, 24, 39, 0.95) !important;
+}
+
+.custom-popup {
+  padding: 8px;
+  font-size: 12px;
+}
+
+.custom-popup-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--neon-cyan);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.custom-popup-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  color: var(--text-secondary);
+}
+
+.custom-popup-row span:last-child {
+  color: #fff;
+  font-family: var(--font-mono);
+}
+
+/* Loading Overlay */
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(8, 11, 17, 0.85);
+  backdrop-filter: blur(8px);
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+}
+
+.spinner {
+  width: 44px;
+  height: 44px;
+  border: 3px solid rgba(0, 229, 255, 0.15);
+  border-top-color: var(--neon-cyan);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-text {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  letter-spacing: 0.02em;
+}
+
+================================================================================
+FILE: frontend/src/main.jsx
+================================================================================
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
