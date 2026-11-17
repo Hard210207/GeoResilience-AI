@@ -5,7 +5,7 @@ import axios from 'axios';
 import 'leaflet/dist/leaflet.css';
 import './App.css';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = "https://georesilience-ai.onrender.com";
 
 function getCriticalityColor(normScore, isHealed = false) {
   if (isHealed) return '#a855f7'; // Neon purple for Phase II MST Healed Bridges
