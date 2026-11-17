@@ -225,7 +225,7 @@ export default function App() {
         <div className="sidebar-header">
           <div className="brand-badge">
             <span className="pulse-dot"></span>
-            ISRO Bharatiya Antariksh Hackathon &bull; PS-4
+            GeoResilience &bull;
           </div>
           <h1 className="sidebar-title">Route Resilience AI</h1>
           <p className="sidebar-subtitle">
