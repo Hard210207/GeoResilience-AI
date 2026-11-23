@@ -225,9 +225,9 @@ export default function App() {
         <div className="sidebar-header">
           <div className="brand-badge">
             <span className="pulse-dot"></span>
-            GeoResilience &bull;
+            GEOSPATIAL VISION & GRAPH ENGINE
           </div>
-          <h1 className="sidebar-title">Route Resilience AI</h1>
+          <h1 className="sidebar-title">GeoResilience AI</h1>
           <p className="sidebar-subtitle">
             Occlusion-Robust Extraction, MST Graph Healing & Criticality Simulator
           </p>
@@ -308,7 +308,7 @@ export default function App() {
 
               <div className="metric-card components-card">
                 <div className="metric-value" style={{ color: '#a855f7' }}>
-                  +{evalMetrics.connectivity_ratio_pct ?? 21.6}%
+                  +{evalMetrics.connectivity_ratio_pct ?? 0.0}%
                 </div>
                 <div className="metric-title">Connectivity Gain</div>
                 <div className="metric-hint">{meta.healed_edges_count || 0} MST Bridges Healed</div>
@@ -412,40 +412,42 @@ export default function App() {
             )}
           </div>
 
-          {/* ISRO EVALUATION PARAMETERS SCORECARD */}
+          {/* MODEL BENCHMARK & LIVE TOPOLOGY METRICS */}
           <div className="panel-card">
             <div className="section-label" style={{ color: 'var(--neon-emerald)' }}>
-              <span>4. ISRO Evaluation Parameters</span>
+              <span>4. Model & Topology Metrics</span>
             </div>
             <table className="kv-table">
               <tbody>
                 <tr>
-                  <td className="kv-key">IoU / Dice (Occlusion-Recall)</td>
+                  <td className="kv-key">SpaceNet Val Benchmark</td>
                   <td className="kv-value">
-                    <span className="kv-badge">{evalMetrics.iou_score} IoU / {evalMetrics.dice_score} Dice</span>
+                    <span className="kv-badge">
+                      {evalMetrics.iou_score ? `${(evalMetrics.iou_score * 100).toFixed(2)}%` : '56.96%'} IoU / {evalMetrics.val_loss ?? '0.4611'} Loss
+                    </span>
                   </td>
                 </tr>
                 <tr>
-                  <td className="kv-key">Relaxed IoU (3–5px Buffer)</td>
+                  <td className="kv-key">Top Choke Point (C_B)</td>
                   <td className="kv-value" style={{ color: 'var(--neon-emerald)', fontWeight: 700 }}>
-                    {evalMetrics.relaxed_iou_3px}
+                    Node #{meta.top_choke_point ?? '—'} ({(meta.top_centrality ?? 0).toFixed(4)})
                   </td>
                 </tr>
                 <tr>
-                  <td className="kv-key">Connectivity Ratio (MST Gain)</td>
-                  <td className="kv-value" style={{ color: '#a855f7', fontWeight: 700 }}>
-                    +{evalMetrics.connectivity_ratio_pct}% LCC
-                  </td>
-                </tr>
-                <tr>
-                  <td className="kv-key">Topological Accuracy (APLS)</td>
+                  <td className="kv-key">Graph Components</td>
                   <td className="kv-value">
-                    {evalMetrics.topological_accuracy_apls} ({evalMetrics.apls_error_pct}% err)
+                    {meta.connected_components ?? 0} (LCC: {meta.largest_component_size ?? 0})
                   </td>
                 </tr>
                 <tr>
-                  <td className="kv-key">Terrain Generalisation</td>
-                  <td className="kv-value">{meta.terrain_type}</td>
+                  <td className="kv-key">Healed Occlusion Bridges</td>
+                  <td className="kv-value" style={{ color: '#a855f7', fontWeight: 700 }}>
+                    {meta.healed_edges_count ?? 0} MST Edges
+                  </td>
+                </tr>
+                <tr>
+                  <td className="kv-key">Terrain Profile</td>
+                  <td className="kv-value">{meta.terrain_type || 'Urban Sector'}</td>
                 </tr>
               </tbody>
             </table>
@@ -512,8 +514,7 @@ export default function App() {
 
       {/* MAIN INTERACTIVE LEAFLET VIEWPORT */}
       <main className="map-viewport" id="map-viewport">
-        <div className="floating-topbar">
-          <div className="floating-pill">
+            <div className="floating-topbar" style={{ left: '58px' }}>          <div className="floating-pill">
             <span style={{ color: 'var(--neon-cyan)', fontWeight: 700 }}>{meta.sector_name}</span>
             <span>|</span>
             <span>R = <strong>{resilienceIndex.toFixed(3)}</strong></span>

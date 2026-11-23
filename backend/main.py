@@ -35,42 +35,36 @@ DEFAULT_GSD = 0.3077
 transformer = Transformer.from_crs("EPSG:32643", "EPSG:4326", always_xy=True)
 ssl_ctx = ssl._create_unverified_context()
 
+MODEL_BENCHMARK = {
+    "val_iou": 0.5696,
+    "val_loss": 0.4611,
+    "architecture": "ResNet-18 U-Net (SpaceNet Mumbai)"
+}
+
 PRESET_SECTORS = {
     "ahmedabad_urban": {
         "name": "Ahmedabad (Vastrapur / University Sector)",
         "terrain": "Semi-Arid Urban Arterial",
         "center": (23.0375, 72.5295),
         "zoom": 17,
-        "iou_score": 0.665,
-        "dice_score": 0.798,
-        "relaxed_iou": 0.851,
     },
     "bengaluru_urban": {
         "name": "Bengaluru (MG Road / Cubbon Road)",
         "terrain": "Dense Urban Canopy",
         "center": (12.9752, 77.6085),
         "zoom": 17,
-        "iou_score": 0.642,
-        "dice_score": 0.782,
-        "relaxed_iou": 0.834,
     },
     "mumbai_spacenet": {
         "name": "Mumbai (SpaceNet AOI-8 Sector)",
         "terrain": "High-Density Urban Shadow",
         "center": (18.9825, 72.8520),
         "zoom": 17,
-        "iou_score": 0.618,
-        "dice_score": 0.764,
-        "relaxed_iou": 0.819,
     },
     "spacenet_raster": {
         "name": "Trained U-Net Validation Tile (skeleton.npy)",
         "terrain": "SpaceNet 5 Pre-computed Artifacts",
         "center": (18.9823, 72.8520),
         "zoom": 17,
-        "iou_score": 0.5696,
-        "dice_score": 0.7258,
-        "relaxed_iou": 0.7840,
     }
 }
 
@@ -825,11 +819,7 @@ def serialize_graph_state(
         except Exception:
             pass
 
-    iou_val = sector_info.get("iou_score", 0.665)
-    dice_val = sector_info.get("dice_score", 0.798)
-    relaxed_iou_val = sector_info.get("relaxed_iou", 0.851)
-    conn_gain_pct = healing_stats.get("connectivity_ratio_gain_pct", 21.6)
-    apls_score = round(min(0.96, 0.86 + (conn_gain_pct / 250.0)), 4)
+    conn_gain_pct = healing_stats.get("connectivity_ratio_gain_pct", 0.0)
 
     metadata = {
         "sector_name": sector_info.get("name", "Live Map Sector"),
@@ -840,7 +830,7 @@ def serialize_graph_state(
         "connected_components": len(connected_components),
         "largest_component_size": max((len(c) for c in connected_components), default=0),
         "top_choke_point": top_gatekeeper["id"] if top_gatekeeper else None,
-        "top_centrality": top_gatekeeper["centrality"] if top_gatekeeper else 0.0,
+        "top_centrality": round(top_gatekeeper["centrality"], 4) if top_gatekeeper else 0.0,
         "commuter_source": commuter_src,
         "commuter_target": commuter_dst,
         "baseline_route": {
@@ -850,12 +840,10 @@ def serialize_graph_state(
             "travel_time_sec": round(baseline_route_length_m / 8.33, 1)
         },
         "evaluation_metrics": {
-            "iou_score": iou_val,
-            "dice_score": dice_val,
-            "relaxed_iou_3px": relaxed_iou_val,
+            "iou_score": MODEL_BENCHMARK["val_iou"],
+            "val_loss": MODEL_BENCHMARK["val_loss"],
+            "model_arch": MODEL_BENCHMARK["architecture"],
             "connectivity_ratio_pct": conn_gain_pct,
-            "topological_accuracy_apls": apls_score,
-            "apls_error_pct": round((1.0 - apls_score) * 100.0, 2),
             "resilience_index_baseline": 1.000
         },
         "healing_summary": healing_stats,
@@ -951,7 +939,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="GeoResilience AI - ISRO 4-Stage Vision & Graph Engine",
+    title="GeoResilience AI - 4-Stage Vision & Graph Engine",
     version="7.0.0",
     lifespan=lifespan
 )
